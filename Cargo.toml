@@ -1,0 +1,34 @@
+[package]
+name = "epulse"
+version = "0.1.0"
+edition = "2021"
+description = "EPulse: Ultra-lightweight Windows system tray background music player in Rust"
+authors = ["Edinter"]
+
+[dependencies]
+# Pure-Rust audio playback + multi-format decoding (MP3, FLAC, WAV, OGG/Vorbis, AAC/MP4)
+rodio = { version = "0.19", default-features = false, features = ["symphonia-all"] }
+
+# Native Win32 system tray icon and context menu
+tray-icon = "0.19"
+
+# Windows Registry access for HKCU\Software\Microsoft\Windows\CurrentVersion\Run
+winreg = "0.52"
+
+# Minimal Win32 message loop, single-instance mutex & clean quit (zero GUI framework overhead)
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",          # required by CreateMutexW's signature
+    "Win32_System_Threading",  # single-instance mutex
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# Aggressive size and performance optimizations for a standalone .exe
+[profile.release]
+opt-level = "z"       # Optimize for minimal binary size and instruction cache footprint
+lto = true            # Enable Link-Time Optimization across all crates
+codegen-units = 1     # Maximize dead-code elimination
+panic = "abort"       # Strip stack unwinding tables
+strip = true          # Strip symbols automatically
