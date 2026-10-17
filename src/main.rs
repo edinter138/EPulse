@@ -40,8 +40,7 @@ use tray_icon::{
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, RegisterHotKey,
-    TranslateMessage, UnregisterHotKey, MSG,
+    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, TranslateMessage, MSG,
 };
 use winreg::enums::*;
 use winreg::RegKey;
@@ -63,6 +62,12 @@ const HOTKEY_PREV_TRACK: i32 = 103;
 const VK_MEDIA_NEXT_TRACK: u32 = 0xB0;
 const VK_MEDIA_PREV_TRACK: u32 = 0xB1;
 const VK_MEDIA_PLAY_PAUSE: u32 = 0xB3;
+
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterHotKey(hWnd: *mut std::ffi::c_void, id: i32, fsModifiers: u32, vk: u32) -> i32;
+    fn UnregisterHotKey(hWnd: *mut std::ffi::c_void, id: i32) -> i32;
+}
 
 // ───────────────────────────── Logging ─────────────────────────────
 
@@ -578,20 +583,26 @@ impl Worker {
                 if let Ok(mut g) = self.now_playing.lock() {
                     *g = None;
                 }
-                if let Some(audio) = &self.audio {
+                if self.audio.is_some() {
                     if repeat {
                         // When repeat is active, the sink contains duplicates of the current song.
                         // Stop the sink and refill to cleanly advance to the next song in the playlist.
-                        audio.sink.stop();
+                        if let Some(audio) = &self.audio {
+                            audio.sink.stop();
+                        }
                         self.fill_queue();
                         let on = self.is_enabled();
-                        if on {
-                            audio.sink.play();
-                        } else {
-                            audio.sink.pause();
+                        if let Some(audio) = &self.audio {
+                            if on {
+                                audio.sink.play();
+                            } else {
+                                audio.sink.pause();
+                            }
                         }
                     } else {
-                        audio.sink.skip_one();
+                        if let Some(audio) = &self.audio {
+                            audio.sink.skip_one();
+                        }
                         self.fill_queue();
                     }
                 } else {
