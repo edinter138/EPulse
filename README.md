@@ -9,7 +9,7 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue?logo=windows)
 ![Language](https://img.shields.io/badge/Language-Rust%202021-orange?logo=rust)
 ![License](https://img.shields.io/badge/License-GPL--3.0-green)
-![Binary Size](https://img.shields.io/badge/Binary%20Size-~1.6%20MB-brightgreen)
+![Binary Size](https://img.shields.io/badge/Binary%20Size-~1.84%20MB-brightgreen)
 
 ---
 
