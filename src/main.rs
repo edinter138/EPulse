@@ -5,7 +5,7 @@
 //!
 //! Features:
 //! - Plays MP3, WAV, FLAC, OGG (Vorbis), M4A and AAC in the background, streaming from disk.
-//! - Gapless playback (two tracks are always queued ahead) with optional shuffle and repeat.
+//! - Gapless playback (two tracks are always queued ahead) with optional repeat.
 //! - In-memory 32x32 RGBA tray icons: green Play badge = playing, red Pause badge = disabled.
 //! - Left-click the tray icon to toggle music; right-click for rich context menu.
 //! - Global multimedia keyboard keys support (Play/Pause, Next Track, Previous Track).
@@ -183,7 +183,6 @@ enum AudioCommand {
     PrevTrack,
     SetVolume(u8),
     SetMute(bool),
-    SetShuffle(bool),
     SetRepeat(bool),
     Rescan,
     Shutdown,
@@ -199,7 +198,6 @@ enum UiMessage {
 #[derive(Debug, Clone)]
 struct AppConfig {
     auto_play_on_startup: bool,
-    shuffle: bool,
     repeat: bool,
     volume_percent: u8,
     custom_music_dir: Option<PathBuf>,
@@ -253,7 +251,6 @@ impl AppConfig {
     fn load() -> Self {
         let mut cfg = Self {
             auto_play_on_startup: true,
-            shuffle: false,
             repeat: false,
             volume_percent: 75,
             custom_music_dir: None,
@@ -272,7 +269,6 @@ impl AppConfig {
                             "auto_play_on_startup" => {
                                 cfg.auto_play_on_startup = v == "true" || v == "1"
                             }
-                            "shuffle" => cfg.shuffle = v == "true" || v == "1",
                             "repeat" => cfg.repeat = v == "true" || v == "1",
                             "volume_percent" => {
                                 if let Ok(vol) = v.parse::<u8>() {
@@ -303,7 +299,6 @@ impl AppConfig {
             let mut file = File::create(&tmp)?;
             writeln!(file, "# {} Configuration", APP_NAME)?;
             writeln!(file, "auto_play_on_startup={}", self.auto_play_on_startup)?;
-            writeln!(file, "shuffle={}", self.shuffle)?;
             writeln!(file, "repeat={}", self.repeat)?;
             writeln!(file, "volume_percent={}", self.volume_percent)?;
             if let Some(dir) = &self.custom_music_dir {
@@ -459,44 +454,19 @@ fn scan_audio_files(dir: &Path) -> Vec<PathBuf> {
     tracks
 }
 
-fn next_rand(state: &mut u64) -> u64 {
-    let mut x = *state;
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    *state = x;
-    x
-}
-
-fn shuffle<T>(items: &mut [T], state: &mut u64) {
-    for i in (1..items.len()).rev() {
-        let j = (next_rand(state) % (i as u64 + 1)) as usize;
-        items.swap(i, j);
-    }
-}
-
 struct Playlist {
     dir: PathBuf,
     tracks: Vec<PathBuf>,
     idx: usize,
-    shuffle: bool,
-    rng: u64,
     last_dir_mtime: Option<SystemTime>,
 }
 
 impl Playlist {
-    fn new(dir: PathBuf, shuffle: bool) -> Self {
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0x9E37_79B9_7F4A_7C15)
-            | 1;
+    fn new(dir: PathBuf) -> Self {
         Self {
             dir,
             tracks: Vec::new(),
             idx: 0,
-            shuffle,
-            rng: seed,
             last_dir_mtime: None,
         }
     }
@@ -504,9 +474,6 @@ impl Playlist {
     fn rebuild(&mut self) {
         self.last_dir_mtime = fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
         self.tracks = scan_audio_files(&self.dir);
-        if self.shuffle {
-            shuffle(&mut self.tracks, &mut self.rng);
-        }
         self.idx = 0;
     }
 
@@ -808,10 +775,6 @@ impl Worker {
                     }
                 }
             }
-            AudioCommand::SetShuffle(on) => {
-                self.playlist.shuffle = on;
-                self.playlist.rebuild();
-            }
             AudioCommand::SetRepeat(on) => {
                 self.repeat.store(on, Ordering::Release);
             }
@@ -1081,8 +1044,7 @@ fn main() {
     let music_dir = config.music_dir();
     let worker_enabled = Arc::clone(&is_enabled);
     let worker_dir = music_dir.clone();
-    let (worker_volume, worker_shuffle, worker_repeat) =
-        (config.volume_percent, config.shuffle, config.repeat);
+    let (worker_volume, worker_repeat) = (config.volume_percent, config.repeat);
 
     let worker_repeat_arc = Arc::new(AtomicBool::new(worker_repeat));
     let worker_repeat_clone = Arc::clone(&worker_repeat_arc);
@@ -1099,7 +1061,7 @@ fn main() {
                 muted: false,
                 repeat: worker_repeat_clone,
                 now_playing: now_playing_clone,
-                playlist: Playlist::new(worker_dir, worker_shuffle),
+                playlist: Playlist::new(worker_dir),
                 audio: None,
                 audio_retry_at: now,
                 queue_retry_at: now,
