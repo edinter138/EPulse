@@ -1,9 +1,12 @@
 [package]
-name = "epulse"
-version = "0.1.0"
-edition = "2021"
+name = "EPulse"
+version = "0.3.0"
+edition = "2026"
 description = "EPulse: Ultra-lightweight Windows system tray background music player in Rust"
 authors = ["Edinter"]
+license = "GPL-3.0-only"
+repository = "https://github.com/edinter138/EPulse"
+readme = "README.md"
 
 [dependencies]
 # Pure-Rust audio playback + multi-format decoding (MP3, FLAC, WAV, OGG/Vorbis, AAC/MP4)
@@ -27,8 +30,8 @@ features = [
 
 # Aggressive size and performance optimizations for a standalone .exe
 [profile.release]
-opt-level = "z"       # Optimize for minimal binary size and instruction cache footprint
-lto = true            # Enable Link-Time Optimization across all crates
-codegen-units = 1     # Maximize dead-code elimination
-panic = "abort"       # Strip stack unwinding tables
-strip = true          # Strip symbols automatically
+opt-level = 3       # Maximize audio DSP decoding throughput and eliminate buffer glitches
+lto = true          # Link-Time Optimization across all crates
+codegen-units = 1   # Maximize inter-procedural optimizations
+panic = "abort"     # Strip stack unwinding tables
+strip = true        # Strip symbols automatically

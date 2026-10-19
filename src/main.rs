@@ -5,13 +5,17 @@
 //!
 //! Features:
 //! - Plays MP3, WAV, FLAC, OGG (Vorbis), M4A and AAC in the background, streaming from disk.
-//! - Gapless playback (two tracks are always queued ahead) with optional shuffle.
+//! - Gapless playback (two tracks are always queued ahead) with optional shuffle and repeat.
 //! - In-memory 32x32 RGBA tray icons: green Play badge = playing, red Pause badge = disabled.
-//! - Left-click the tray icon (or use the menu) to disable/enable music.
-//! - Volume submenu, "Run on Windows Startup" (HKCU\...\Run) and "Auto-Play on Startup".
+//! - Left-click the tray icon to toggle music; right-click for rich context menu.
+//! - Global multimedia keyboard keys support (Play/Pause, Next Track, Previous Track).
+//! - Automatic detection of new or deleted songs without restarting the app.
+//! - Live "Now Playing" track title in the menu (escaped for Win32 &) and hover tooltip.
+//! - Volume submenu with Mute toggle and live percentage in the title.
+//! - Previous Track (⏮) and Next Track (⏭) navigation (even while Repeat is active).
+//! - Clean Settings submenu for "Run on Windows Startup" and "Auto-Play".
 //! - Single instance, clean exit (no ghost tray icon), recovers from audio-device changes.
-//! - Config lives in `%APPDATA%\EPulse\config.ini`. If a `config.ini` already sits next to
-//!   `epulse.exe`, EPulse runs in portable mode and keeps everything next to the exe instead.
+//! - Config lives in `%APPDATA%\EPulse\config.ini` (or alongside exe in portable mode).
 //! - Problems are written to `epulse.log` next to the config (capped at 64 KB).
 
 use std::env;
@@ -22,7 +26,7 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -34,9 +38,14 @@ use tray_icon::{
     Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent,
 };
 use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-use windows_sys::Win32::System::Threading::CreateMutexW;
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, GetCurrentThread, GetCurrentThreadId, ProcessPowerThrottling,
+    SetProcessInformation, SetThreadPriority, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    PROCESS_POWER_THROTTLING_STATE, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_TIME_CRITICAL,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, PostQuitMessage, TranslateMessage, MSG,
+    DispatchMessageW, GetMessageW, PostQuitMessage, PostThreadMessageW, TranslateMessage, MSG,
 };
 use winreg::enums::*;
 use winreg::RegKey;
@@ -48,6 +57,92 @@ const REGISTRY_RUN_PATH: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\R
 const SUPPORTED_EXTENSIONS: &[&str] = &["mp3", "wav", "flac", "ogg", "m4a", "aac"];
 const VOLUME_LEVELS: [u8; 4] = [25, 50, 75, 100];
 const MAX_SCAN_DEPTH: u32 = 16;
+/// Worker poll interval while playing (queue top-up, folder/device checks). While paused the
+/// worker sleeps until the next command instead of polling.
+const PLAYING_TICK: Duration = Duration::from_millis(500);
+/// File read buffer per decoder. Reads happen on the decode thread and ~3 s of decoded audio is
+/// prefetched, so this only needs to batch syscalls (Symphonia keeps its own 64 KB window too).
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+const WM_TRACK_CHANGED: u32 = 0x0400 + 1;
+
+// Win32 Global Media Keys Constants
+const WM_HOTKEY: u32 = 0x0312;
+const HOTKEY_PLAY_PAUSE: i32 = 101;
+const HOTKEY_NEXT_TRACK: i32 = 102;
+const HOTKEY_PREV_TRACK: i32 = 103;
+const VK_MEDIA_NEXT_TRACK: u32 = 0xB0;
+const VK_MEDIA_PREV_TRACK: u32 = 0xB1;
+const VK_MEDIA_PLAY_PAUSE: u32 = 0xB3;
+
+#[link(name = "user32")]
+extern "system" {
+    fn RegisterHotKey(hWnd: *mut std::ffi::c_void, id: i32, fsModifiers: u32, vk: u32) -> i32;
+    fn UnregisterHotKey(hWnd: *mut std::ffi::c_void, id: i32) -> i32;
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn LoadLibraryA(lpLibFileName: *const u8) -> *mut std::ffi::c_void;
+    fn GetProcAddress(hModule: *mut std::ffi::c_void, lpProcName: *const u8) -> *mut std::ffi::c_void;
+}
+
+#[link(name = "avrt")]
+extern "system" {
+    fn AvSetMmThreadCharacteristicsW(
+        task_name: *const u16,
+        task_index: *mut u32,
+    ) -> *mut std::ffi::c_void;
+}
+
+// ───────────────────────────── Priority & power throttling ─────────────────────────────
+
+/// Opts the process out of Windows 11 "efficiency mode" (EcoQoS) and timer-resolution
+/// throttling. A windowless tray app is a prime candidate for both, and either can make audio
+/// stutter while other apps are busy. A harmless no-op on Windows versions without it.
+fn opt_out_of_power_throttling() {
+    let state = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0, // control bit set + state bit clear = throttling disabled
+    };
+    unsafe {
+        SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &state as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+/// Puts the calling (audio callback) thread into the MMCSS "Audio" class, the way Windows
+/// expects real-time audio threads to run, falling back to a plain priority bump. Runs once per
+/// thread. (cpal 0.15 tries to raise its callback thread but passes a thread id where a handle
+/// is required, so in practice the callback ran at normal priority.)
+fn boost_audio_thread() {
+    thread_local! {
+        static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if DONE.with(|d| d.replace(true)) {
+        return;
+    }
+    unsafe {
+        let task = [65u16, 117, 100, 105, 111, 0]; // "Audio", NUL-terminated UTF-16
+        let mut index = 0u32;
+        // The MMCSS registration lives as long as the audio thread, so it is never reverted.
+        if AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index).is_null() {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+    }
+}
+
+/// Decode threads only need a small edge over normal threads: they run ahead of real time.
+fn on_decode_thread_start() {
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+}
 
 // ───────────────────────────── Logging ─────────────────────────────
 
@@ -78,27 +173,35 @@ fn acquire_single_instance() -> bool {
     }
 }
 
-// ───────────────────────────── Config ─────────────────────────────
+// ───────────────────────────── Config & Commands ─────────────────────────────
 
 /// Commands sent from the Win32 tray thread to the audio worker thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioCommand {
     SetEnabled(bool),
     NextTrack,
+    PrevTrack,
     SetVolume(u8),
+    SetMute(bool),
     SetShuffle(bool),
+    SetRepeat(bool),
+    Rescan,
     Shutdown,
+}
+
+/// Messages sent from the audio worker thread back to the Win32 tray thread.
+#[derive(Debug, Clone)]
+enum UiMessage {
+    TrackChanged(String),
 }
 
 /// Persistent user configuration (`config.ini`, simple key=value).
 #[derive(Debug, Clone)]
 struct AppConfig {
-    /// `true`: music starts playing on every launch. `false`: EPulse starts disabled.
     auto_play_on_startup: bool,
     shuffle: bool,
+    repeat: bool,
     volume_percent: u8,
-    /// Only set when the user configured a custom folder. It is kept as-is even if the folder
-    /// is currently unavailable (e.g. an external drive that is not mounted yet at boot).
     custom_music_dir: Option<PathBuf>,
 }
 
@@ -111,7 +214,7 @@ impl AppConfig {
     }
 
     /// Portable mode if `config.ini` already sits next to the exe, otherwise `%APPDATA%\EPulse`.
-    fn data_dir() -> PathBuf {
+    fn data_dir() -> &'static Path {
         static DIR: OnceLock<PathBuf> = OnceLock::new();
         DIR.get_or_init(|| {
             let exe_dir = Self::exe_dir();
@@ -126,7 +229,7 @@ impl AppConfig {
             }
             exe_dir
         })
-        .clone()
+        .as_path()
     }
 
     fn config_path() -> PathBuf {
@@ -151,6 +254,7 @@ impl AppConfig {
         let mut cfg = Self {
             auto_play_on_startup: true,
             shuffle: false,
+            repeat: false,
             volume_percent: 75,
             custom_music_dir: None,
         };
@@ -158,7 +262,7 @@ impl AppConfig {
         match File::open(Self::config_path()) {
             Ok(file) => {
                 for line in BufReader::new(file).lines().map_while(Result::ok) {
-                    let trimmed = line.trim_start_matches('\u{feff}').trim(); // tolerate a BOM
+                    let trimmed = line.trim_start_matches('\u{feff}').trim();
                     if trimmed.is_empty() || trimmed.starts_with('#') {
                         continue;
                     }
@@ -169,6 +273,7 @@ impl AppConfig {
                                 cfg.auto_play_on_startup = v == "true" || v == "1"
                             }
                             "shuffle" => cfg.shuffle = v == "true" || v == "1",
+                            "repeat" => cfg.repeat = v == "true" || v == "1",
                             "volume_percent" => {
                                 if let Ok(vol) = v.parse::<u8>() {
                                     cfg.volume_percent = vol.min(100);
@@ -179,7 +284,7 @@ impl AppConfig {
                                     cfg.custom_music_dir = Some(PathBuf::from(v));
                                 }
                             }
-                            _ => {} // unknown / legacy keys (e.g. music_enabled) are ignored
+                            _ => {}
                         }
                     }
                 }
@@ -191,7 +296,6 @@ impl AppConfig {
         cfg
     }
 
-    /// Writes to a temp file and renames it, so a crash can never leave an empty config.
     fn save(&self) -> std::io::Result<()> {
         let path = Self::config_path();
         let tmp = path.with_extension("ini.tmp");
@@ -200,6 +304,7 @@ impl AppConfig {
             writeln!(file, "# {} Configuration", APP_NAME)?;
             writeln!(file, "auto_play_on_startup={}", self.auto_play_on_startup)?;
             writeln!(file, "shuffle={}", self.shuffle)?;
+            writeln!(file, "repeat={}", self.repeat)?;
             writeln!(file, "volume_percent={}", self.volume_percent)?;
             if let Some(dir) = &self.custom_music_dir {
                 writeln!(file, "music_dir={}", dir.display())?;
@@ -212,7 +317,6 @@ impl AppConfig {
 // ───────────────────────────── Windows startup (registry) ─────────────────────────────
 
 fn startup_command() -> std::io::Result<String> {
-    // `--autostart` is no longer needed by the app but is kept so old entries stay identical.
     let exe_path = env::current_exe()?;
     Ok(format!("\"{}\" --autostart", exe_path.display()))
 }
@@ -236,7 +340,6 @@ fn set_registered_in_startup(enable: bool) -> std::io::Result<()> {
     Ok(())
 }
 
-/// If EPulse is registered for startup but the exe was moved, point the entry at the new path.
 fn refresh_startup_path() {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     if let Ok(run_key) = hkcu.open_subkey_with_flags(REGISTRY_RUN_PATH, KEY_READ | KEY_WRITE) {
@@ -253,8 +356,6 @@ fn refresh_startup_path() {
 
 // ───────────────────────────── Tray icon ─────────────────────────────
 
-/// Procedurally renders a 32x32 RGBA icon:
-/// enabled = green disc + white Play triangle, disabled = red disc + white Pause bars + slash.
 fn build_status_icon(enabled: bool) -> Icon {
     const SIZE: u32 = 32;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
@@ -276,9 +377,9 @@ fn build_status_icon(enabled: bool) -> Icon {
                 };
 
                 let (mut r, mut g, mut b) = if enabled {
-                    (22u8, 163u8, 74u8) // #16A34A
+                    (22u8, 163u8, 74u8) // #16A34A Emerald
                 } else {
-                    (185u8, 28u8, 28u8) // #B91C1C
+                    (185u8, 28u8, 28u8) // #B91C1C Crimson
                 };
 
                 let is_symbol = if enabled {
@@ -287,10 +388,8 @@ fn build_status_icon(enabled: bool) -> Icon {
                         && (y as f32) >= (10.0 + (x - 11) as f32 * 0.5)
                         && (y as f32) <= (21.0 - (x - 11) as f32 * 0.5)
                 } else {
-                    let in_bars =
-                        ((x >= 11 && x <= 14) || (x >= 17 && x <= 20)) && (y >= 10 && y <= 21);
-                    let in_slash = (x as i32 - y as i32).abs() <= 1 && dist <= 10.5;
-                    in_bars || in_slash
+                    // Crisp vertical Pause bars (||) without the cluttered diagonal slash
+                    ((x >= 11 && x <= 14) || (x >= 17 && x <= 20)) && (y >= 10 && y <= 21)
                 };
 
                 if is_symbol {
@@ -310,18 +409,24 @@ fn build_status_icon(enabled: bool) -> Icon {
     Icon::from_rgba(rgba, SIZE, SIZE).expect("Failed to construct EPulse tray icon")
 }
 
-fn tooltip(playing: bool) -> &'static str {
-    if playing {
-        "EPulse: Playing (Left-click icon to disable)"
-    } else {
-        "EPulse: Disabled (Left-click icon to enable)"
+fn tooltip(playing: bool, title: Option<&str>) -> String {
+    let state = if playing { "Playing" } else { "Paused" };
+    match title {
+        Some(t) => {
+            let short: String = if t.chars().count() > 70 {
+                let prefix: String = t.chars().take(67).collect();
+                format!("{prefix}...")
+            } else {
+                t.to_string()
+            };
+            format!("EPulse: {short} ({state})")
+        }
+        None => format!("EPulse: {state} (Left-click icon to toggle)"),
     }
 }
 
 // ───────────────────────────── Playlist ─────────────────────────────
 
-/// Recursively collects audio files. Uses `file_type()` (does not follow symlinks/junctions),
-/// so link loops cannot cause unbounded recursion; depth is capped as a second safety net.
 fn scan_into(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
     if depth > MAX_SCAN_DEPTH {
         return;
@@ -337,7 +442,10 @@ fn scan_into(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
         if file_type.is_dir() {
             scan_into(&path, depth + 1, out);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if SUPPORTED_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()) {
+            if SUPPORTED_EXTENSIONS
+                .iter()
+                .any(|s| ext.eq_ignore_ascii_case(s))
+            {
                 out.push(path);
             }
         }
@@ -347,12 +455,11 @@ fn scan_into(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
 fn scan_audio_files(dir: &Path) -> Vec<PathBuf> {
     let mut tracks = Vec::new();
     scan_into(dir, 0, &mut tracks);
-    tracks.sort_by_key(|p| p.to_string_lossy().to_lowercase());
+    tracks.sort_by_cached_key(|p| p.to_string_lossy().to_lowercase());
     tracks
 }
 
 fn next_rand(state: &mut u64) -> u64 {
-    // xorshift64: plenty for shuffling, no extra dependency
     let mut x = *state;
     x ^= x << 13;
     x ^= x >> 7;
@@ -371,10 +478,10 @@ fn shuffle<T>(items: &mut [T], state: &mut u64) {
 struct Playlist {
     dir: PathBuf,
     tracks: Vec<PathBuf>,
-    /// Index of the next track to hand out.
     idx: usize,
     shuffle: bool,
     rng: u64,
+    last_dir_mtime: Option<SystemTime>,
 }
 
 impl Playlist {
@@ -390,10 +497,12 @@ impl Playlist {
             idx: 0,
             shuffle,
             rng: seed,
+            last_dir_mtime: None,
         }
     }
 
     fn rebuild(&mut self) {
+        self.last_dir_mtime = fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
         self.tracks = scan_audio_files(&self.dir);
         if self.shuffle {
             shuffle(&mut self.tracks, &mut self.rng);
@@ -401,8 +510,17 @@ impl Playlist {
         self.idx = 0;
     }
 
-    /// Next track. At the end of a cycle the folder is rescanned (and reshuffled), so newly
-    /// added songs are picked up without restarting EPulse.
+    /// Automatically detects if files were added or removed from the folder
+    fn check_rescan(&mut self) -> bool {
+        let current_mtime = fs::metadata(&self.dir).and_then(|m| m.modified()).ok();
+        if current_mtime.is_some() && current_mtime != self.last_dir_mtime {
+            self.rebuild();
+            true
+        } else {
+            false
+        }
+    }
+
     fn next(&mut self) -> Option<PathBuf> {
         if self.idx >= self.tracks.len() {
             self.rebuild();
@@ -412,7 +530,6 @@ impl Playlist {
         Some(path)
     }
 
-    /// Steps back `n` tracks (used to replay queued tracks after the audio device changed).
     fn rewind(&mut self, n: usize) {
         let len = self.tracks.len();
         if len > 0 {
@@ -424,7 +541,6 @@ impl Playlist {
 // ───────────────────────────── Audio worker ─────────────────────────────
 
 fn vol_to_gain(percent: u8) -> f32 {
-    // Squared curve: closer to perceived loudness than a linear amplitude scale.
     let v = (percent as f32 / 100.0).clamp(0.0, 1.0);
     v * v
 }
@@ -458,18 +574,151 @@ fn open_audio(volume: u8) -> Option<Audio> {
 
 fn open_decoder(path: &Path) -> Option<Decoder<BufReader<File>>> {
     let file = File::open(path).ok()?;
-    Decoder::new(BufReader::with_capacity(16 * 1024, file)).ok()
+    Decoder::new(BufReader::with_capacity(READ_BUFFER_BYTES, file)).ok()
+}
+
+/// Wraps a rodio source to trigger a callback as soon as the first sample is pulled for playback.
+struct TrackNotifier<S> {
+    source: S,
+    skipped: bool,
+    on_start: Option<Box<dyn FnOnce() -> bool + Send + 'static>>,
+}
+
+impl<S: rodio::Source> rodio::Source for TrackNotifier<S>
+where
+    S::Item: rodio::Sample,
+{
+    #[inline]
+    fn current_frame_len(&self) -> Option<usize> {
+        self.source.current_frame_len()
+    }
+    #[inline]
+    fn channels(&self) -> u16 {
+        self.source.channels()
+    }
+    #[inline]
+    fn sample_rate(&self) -> u32 {
+        self.source.sample_rate()
+    }
+    #[inline]
+    fn total_duration(&self) -> Option<Duration> {
+        self.source.total_duration()
+    }
+}
+
+impl<S: Iterator> Iterator for TrackNotifier<S> {
+    type Item = S::Item;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(cb) = self.on_start.take() {
+            if !cb() {
+                self.skipped = true;
+            }
+        }
+        if self.skipped {
+            return None;
+        }
+        self.source.next()
+    }
+}
+
+/// Samples per decoded chunk handed from the decode thread to the audio thread (~93 ms stereo).
+const PREFETCH_CHUNK_SAMPLES: usize = 8192;
+/// Chunks buffered ahead per track: about 3 s of 44.1 kHz stereo (~512 KB) of headroom.
+const PREFETCH_CHUNKS: usize = 32;
+
+/// Decodes a track on its own thread and hands finished chunks to the audio callback, so the
+/// real-time thread only copies samples instead of reading files and running codecs. A CPU spike
+/// elsewhere then has to outlast the prefetched seconds before it can be heard.
+struct Prefetched {
+    rx: Receiver<Vec<i16>>,
+    chunk: std::vec::IntoIter<i16>,
+    channels: u16,
+    sample_rate: u32,
+    total: Option<Duration>,
+}
+
+fn prefetch<S>(mut source: S) -> Prefetched
+where
+    S: rodio::Source<Item = i16> + Send + 'static,
+{
+    let (channels, sample_rate, total) =
+        (source.channels(), source.sample_rate(), source.total_duration());
+    let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(PREFETCH_CHUNKS);
+    let spawned = thread::Builder::new()
+        .name("epulse-decode".into())
+        .spawn(move || {
+            on_decode_thread_start();
+            loop {
+                let chunk: Vec<i16> = source.by_ref().take(PREFETCH_CHUNK_SAMPLES).collect();
+                // Stop at end of track, or as soon as the audio side dropped the receiver
+                // (skip / stop), so abandoned tracks never keep a thread alive.
+                if chunk.is_empty() || tx.send(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+    if spawned.is_err() {
+        // Extremely unlikely (out of memory). The track then simply ends immediately.
+        log_line("failed to spawn decode thread");
+    }
+    Prefetched {
+        rx,
+        chunk: Vec::new().into_iter(),
+        channels,
+        sample_rate,
+        total,
+    }
+}
+
+impl Iterator for Prefetched {
+    type Item = i16;
+    #[inline]
+    fn next(&mut self) -> Option<i16> {
+        loop {
+            if let Some(sample) = self.chunk.next() {
+                return Some(sample);
+            }
+            // Err = decode thread finished and everything was consumed: end of track.
+            self.chunk = self.rx.recv().ok()?.into_iter();
+        }
+    }
+}
+
+impl rodio::Source for Prefetched {
+    #[inline]
+    fn current_frame_len(&self) -> Option<usize> {
+        None // format is constant for the whole track
+    }
+    #[inline]
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    #[inline]
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+    #[inline]
+    fn total_duration(&self) -> Option<Duration> {
+        self.total
+    }
 }
 
 struct Worker {
     enabled: Arc<AtomicBool>,
     volume: u8,
+    muted: bool,
+    repeat: Arc<AtomicBool>,
+    /// The track that is actually audible right now (set by the audio callback when it starts).
+    now_playing: Arc<Mutex<Option<PathBuf>>>,
     playlist: Playlist,
     audio: Option<Audio>,
     audio_retry_at: Instant,
     queue_retry_at: Instant,
     last_device_check: Instant,
     audio_failure_logged: bool,
+    ui_tx: Sender<UiMessage>,
+    main_thread_id: u32,
 }
 
 impl Worker {
@@ -477,7 +726,17 @@ impl Worker {
         self.enabled.load(Ordering::Acquire)
     }
 
-    /// Returns `false` when the worker should exit.
+    /// Re-applies the current enabled/paused state to the sink (after `stop()` + refill).
+    fn apply_play_state(&self) {
+        if let Some(audio) = &self.audio {
+            if self.is_enabled() {
+                audio.sink.play();
+            } else {
+                audio.sink.pause();
+            }
+        }
+    }
+
     fn handle(&mut self, cmd: AudioCommand) -> bool {
         match cmd {
             AudioCommand::SetEnabled(on) => {
@@ -490,22 +749,75 @@ impl Worker {
                 }
             }
             AudioCommand::NextTrack => {
-                if let Some(audio) = &self.audio {
-                    audio.sink.skip_one(); // skips only the current track, keeps the prefetched one
-                    self.fill_queue();
+                let repeat = self.repeat.load(Ordering::Acquire);
+                if let Ok(mut g) = self.now_playing.lock() {
+                    *g = None;
+                }
+                if self.audio.is_some() {
+                    if repeat {
+                        // When repeat is active, the sink contains duplicates of the current song.
+                        // Stop the sink and refill to cleanly advance to the next song in the playlist.
+                        if let Some(audio) = &self.audio {
+                            audio.sink.stop();
+                        }
+                        self.fill_queue();
+                        self.apply_play_state();
+                    } else {
+                        if let Some(audio) = &self.audio {
+                            audio.sink.skip_one();
+                        }
+                        self.fill_queue();
+                    }
                 } else {
                     let _ = self.playlist.next();
                 }
             }
+            AudioCommand::PrevTrack => {
+                let repeat = self.repeat.load(Ordering::Acquire);
+                if let Ok(mut g) = self.now_playing.lock() {
+                    *g = None;
+                }
+                if self.audio.is_some() {
+                    let pending = self.audio.as_ref().map_or(0, |a| a.sink.len());
+                    let rewind_count = if repeat { 2 } else { pending + 1 };
+                    self.playlist.rewind(rewind_count);
+                    if let Some(a) = &self.audio {
+                        a.sink.stop();
+                    }
+                    self.fill_queue();
+                    self.apply_play_state();
+                } else {
+                    self.playlist.rewind(1);
+                }
+            }
             AudioCommand::SetVolume(vol) => {
                 self.volume = vol;
+                if !self.muted {
+                    if let Some(audio) = &self.audio {
+                        audio.sink.set_volume(vol_to_gain(vol));
+                    }
+                }
+            }
+            AudioCommand::SetMute(muted) => {
+                self.muted = muted;
                 if let Some(audio) = &self.audio {
-                    audio.sink.set_volume(vol_to_gain(vol));
+                    if muted {
+                        audio.sink.set_volume(0.0);
+                    } else {
+                        audio.sink.set_volume(vol_to_gain(self.volume));
+                    }
                 }
             }
             AudioCommand::SetShuffle(on) => {
                 self.playlist.shuffle = on;
                 self.playlist.rebuild();
+            }
+            AudioCommand::SetRepeat(on) => {
+                self.repeat.store(on, Ordering::Release);
+            }
+            AudioCommand::Rescan => {
+                self.playlist.rebuild();
+                self.fill_queue();
             }
             AudioCommand::Shutdown => {
                 if let Some(audio) = &self.audio {
@@ -517,13 +829,12 @@ impl Worker {
         true
     }
 
-    /// (Re)opens the output stream when needed. Retries every 2 s, which covers audio services
-    /// that are not ready yet right after Windows login.
     fn ensure_audio(&mut self) {
         if self.audio.is_some() || Instant::now() < self.audio_retry_at {
             return;
         }
-        match open_audio(self.volume) {
+        let effective_vol = if self.muted { 0 } else { self.volume };
+        match open_audio(effective_vol) {
             Some(audio) => {
                 log_line(&format!("audio output opened: {:?}", audio.device));
                 self.audio_failure_logged = false;
@@ -539,29 +850,32 @@ impl Worker {
         }
     }
 
-    /// Detects a changed/removed default output device (headphones, Bluetooth, USB DAC) and
-    /// rebuilds the stream. Tracks that were queued but not finished are replayed.
     fn check_device(&mut self) {
-        if self.last_device_check.elapsed() < Duration::from_secs(3) {
+        if self.last_device_check.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.last_device_check = Instant::now();
         let Some(audio) = &self.audio else {
             return;
         };
-        let current = default_device_name();
-        if current != audio.device {
+        let new_dev = default_device_name();
+        if new_dev != audio.device {
             log_line(&format!(
                 "default output device changed: {:?} -> {:?}",
-                audio.device, current
+                audio.device, new_dev
             ));
             let pending = audio.sink.len();
-            self.playlist.rewind(pending);
-            self.audio = None; // reopened by ensure_audio()
+            let rewind_count = if self.repeat.load(Ordering::Acquire) {
+                1.min(pending)
+            } else {
+                pending
+            };
+            self.playlist.rewind(rewind_count);
+            self.audio = None;
+            self.ensure_audio(); // Rebuild immediately if a device is ready
         }
     }
 
-    /// Keeps two tracks queued so there is no gap between songs.
     fn fill_queue(&mut self) {
         if Instant::now() < self.queue_retry_at {
             return;
@@ -571,20 +885,73 @@ impl Worker {
         };
         let mut failures = 0usize;
         while audio.sink.len() < 2 {
-            let Some(path) = self.playlist.next() else {
-                // Empty or unavailable folder: look again in a few seconds.
+            let repeat = self.repeat.load(Ordering::Acquire);
+            let path = if repeat {
+                let now = self.now_playing.lock().ok().and_then(|g| g.clone());
+                match now {
+                    Some(p) => Some(p),
+                    None => {
+                        if audio.sink.len() >= 1 {
+                            return;
+                        }
+                        self.playlist.next()
+                    }
+                }
+            } else {
+                self.playlist.next()
+            };
+
+            let Some(track_path) = path else {
                 self.queue_retry_at = Instant::now() + Duration::from_secs(3);
                 return;
             };
-            match open_decoder(&path) {
+
+            match open_decoder(&track_path) {
                 Some(source) => {
-                    audio.sink.append(source);
+                    let ui_tx = self.ui_tx.clone();
+                    let main_thread_id = self.main_thread_id;
+                    let repeat_flag = Arc::clone(&self.repeat);
+                    let now_playing = Arc::clone(&self.now_playing);
+                    let queued_with_repeat = repeat;
+                    let path_for_cb = track_path.clone();
+                    let title = track_path
+                        .file_stem()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("Unknown Track")
+                        .to_string();
+
+                    let notifier = TrackNotifier {
+                        source: prefetch(source),
+                        skipped: false,
+                        on_start: Some(Box::new(move || {
+                            // First sample of a track is pulled by the audio callback thread.
+                            boost_audio_thread();
+                            // If Repeat was turned on after queueing, drop to repeat current song
+                            if repeat_flag.load(Ordering::Acquire) && !queued_with_repeat {
+                                return false;
+                            }
+                            if let Ok(mut g) = now_playing.lock() {
+                                *g = Some(path_for_cb);
+                            }
+                            let _ = ui_tx.send(UiMessage::TrackChanged(title));
+                            unsafe {
+                                PostThreadMessageW(main_thread_id, WM_TRACK_CHANGED, 0, 0);
+                            }
+                            true
+                        })),
+                    };
+
+                    audio.sink.append(notifier);
                     failures = 0;
                 }
                 None => {
+                    if repeat {
+                        if let Ok(mut g) = self.now_playing.lock() {
+                            *g = None;
+                        }
+                    }
                     failures += 1;
                     if failures >= self.playlist.tracks.len().max(1) {
-                        // Every track failed to open/decode: back off instead of spinning.
                         self.queue_retry_at = Instant::now() + Duration::from_secs(3);
                         return;
                     }
@@ -599,20 +966,31 @@ impl Worker {
         }
         self.ensure_audio();
         self.check_device();
+        self.playlist.check_rescan();
         self.fill_queue();
     }
 
     fn run(mut self, cmd_rx: Receiver<AudioCommand>) {
         loop {
-            // Wake instantly on a command, otherwise every 250 ms to top up the queue.
-            match cmd_rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(cmd) => {
-                    if !self.handle(cmd) {
-                        return;
-                    }
+            // While paused there is nothing to poll, so block until the next command.
+            // `enabled` only ever changes together with a `SetEnabled` command, so no wakeup
+            // can be lost between this check and the receive.
+            let first = if self.is_enabled() {
+                match cmd_rx.recv_timeout(PLAYING_TICK) {
+                    Ok(cmd) => Some(cmd),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
+            } else {
+                match cmd_rx.recv() {
+                    Ok(cmd) => Some(cmd),
+                    Err(_) => return,
+                }
+            };
+            if let Some(cmd) = first {
+                if !self.handle(cmd) {
+                    return;
+                }
             }
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if !self.handle(cmd) {
@@ -624,28 +1002,93 @@ impl Worker {
     }
 }
 
-// ───────────────────────────── main ─────────────────────────────
+// ───────────────────────────── Native Dark Mode & main ─────────────────────────────
+
+/// Automatically opts in to Windows 10/11 native Dark Mode for Win32 tray context menus.
+fn enable_native_dark_mode() {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let is_dark = hkcu
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+        .map(|key| {
+            let apps_dark = key
+                .get_value::<u32, _>("AppsUseLightTheme")
+                .map(|v| v == 0)
+                .unwrap_or(false);
+            let sys_dark = key
+                .get_value::<u32, _>("SystemUsesLightTheme")
+                .map(|v| v == 0)
+                .unwrap_or(false);
+            apps_dark || sys_dark
+        })
+        .unwrap_or(true); // Default to dark mode if undetectable
+
+    unsafe {
+        let uxtheme_name = b"uxtheme.dll\0";
+        let uxtheme = LoadLibraryA(uxtheme_name.as_ptr());
+        if uxtheme.is_null() {
+            return;
+        }
+
+        // Ordinal 135: SetPreferredAppMode (Win10 1903+) or AllowDarkModeForApp (Win10 1809)
+        // PreferredAppMode: 0 = Default, 1 = AllowDark, 2 = ForceDark, 3 = ForceLight
+        let set_preferred_app_mode_ptr = GetProcAddress(uxtheme, 135 as usize as *const u8);
+        if !set_preferred_app_mode_ptr.is_null() {
+            type SetPreferredAppModeFn = unsafe extern "system" fn(i32) -> i32;
+            let set_preferred_app_mode: SetPreferredAppModeFn =
+                std::mem::transmute(set_preferred_app_mode_ptr);
+            let mode = if is_dark { 2 /* ForceDark */ } else { 1 /* AllowDark */ };
+            set_preferred_app_mode(mode);
+        }
+
+        // Ordinal 136: FlushMenuThemes forces popup menus to reload their visual style
+        let flush_menu_themes_ptr = GetProcAddress(uxtheme, 136 as usize as *const u8);
+        if !flush_menu_themes_ptr.is_null() {
+            type FlushMenuThemesFn = unsafe extern "system" fn();
+            let flush_menu_themes: FlushMenuThemesFn = std::mem::transmute(flush_menu_themes_ptr);
+            flush_menu_themes();
+        }
+
+        // Ordinal 104: RefreshImmersiveColorPolicyState
+        let refresh_ptr = GetProcAddress(uxtheme, 104 as usize as *const u8);
+        if !refresh_ptr.is_null() {
+            type RefreshFn = unsafe extern "system" fn();
+            let refresh: RefreshFn = std::mem::transmute(refresh_ptr);
+            refresh();
+        }
+    }
+}
 
 fn main() {
     std::panic::set_hook(Box::new(|info| log_line(&format!("panic: {info}"))));
 
     if !acquire_single_instance() {
-        return; // EPulse is already running
+        return;
     }
+    opt_out_of_power_throttling();
+
+    // Apply native Windows Dark Mode before creating tray icon and menus
+    enable_native_dark_mode();
 
     let mut config = AppConfig::load();
     refresh_startup_path();
 
-    // Simple, predictable rule: auto-play on => every launch starts playing; off => starts disabled.
     let initial_playing = config.auto_play_on_startup;
     let is_enabled = Arc::new(AtomicBool::new(initial_playing));
     let (cmd_tx, cmd_rx): (Sender<AudioCommand>, Receiver<AudioCommand>) = mpsc::channel();
+    let (ui_tx, ui_rx): (Sender<UiMessage>, Receiver<UiMessage>) = mpsc::channel();
+    let main_thread_id = unsafe { GetCurrentThreadId() };
 
     let music_dir = config.music_dir();
-    // The Worker holds a cpal stream (not `Send`), so it is built inside the audio thread.
     let worker_enabled = Arc::clone(&is_enabled);
     let worker_dir = music_dir.clone();
-    let (worker_volume, worker_shuffle) = (config.volume_percent, config.shuffle);
+    let (worker_volume, worker_shuffle, worker_repeat) =
+        (config.volume_percent, config.shuffle, config.repeat);
+
+    let worker_repeat_arc = Arc::new(AtomicBool::new(worker_repeat));
+    let worker_repeat_clone = Arc::clone(&worker_repeat_arc);
+    let now_playing = Arc::new(Mutex::new(None));
+    let now_playing_clone = Arc::clone(&now_playing);
+
     let worker_thread = thread::Builder::new()
         .name("epulse-audio".into())
         .spawn(move || {
@@ -653,12 +1096,17 @@ fn main() {
             Worker {
                 enabled: worker_enabled,
                 volume: worker_volume,
+                muted: false,
+                repeat: worker_repeat_clone,
+                now_playing: now_playing_clone,
                 playlist: Playlist::new(worker_dir, worker_shuffle),
                 audio: None,
                 audio_retry_at: now,
                 queue_retry_at: now,
                 last_device_check: now,
                 audio_failure_logged: false,
+                ui_tx,
+                main_thread_id,
             }
             .run(cmd_rx);
         })
@@ -666,19 +1114,46 @@ fn main() {
 
     let icon_active = build_status_icon(true);
     let icon_disabled = build_status_icon(false);
+    let mut current_title: Option<String> = None;
 
-    // ── Tray menu ──
+    // Register optional Global Windows Multimedia Keys (Play/Pause, Next, Previous)
+    unsafe {
+        RegisterHotKey(std::ptr::null_mut(), HOTKEY_PLAY_PAUSE, 0, VK_MEDIA_PLAY_PAUSE);
+        RegisterHotKey(std::ptr::null_mut(), HOTKEY_NEXT_TRACK, 0, VK_MEDIA_NEXT_TRACK);
+        RegisterHotKey(std::ptr::null_mut(), HOTKEY_PREV_TRACK, 0, VK_MEDIA_PREV_TRACK);
+    }
+
+    // ── Upgraded Tray Menu ──
     let tray_menu = Menu::new();
-    let item_enable_music =
-        CheckMenuItem::new("Enable EPulse Music (Left-Click Icon)", true, initial_playing, None);
-    let item_next_track = MenuItem::new("Skip to Next Track", true, None);
-    let item_shuffle = CheckMenuItem::new("Shuffle", true, config.shuffle, None);
 
+    // 1. Now Playing Banner (Disabled, unclickable header)
+    let item_now_playing = MenuItem::new("🎵 EPulse Music Player", false, None);
+
+    // 2. Play / Pause with dynamic label
+    let play_pause_label = if initial_playing {
+        "⏸ Pause (Left-Click Icon)"
+    } else {
+        "▶ Resume Playback (Left-Click Icon)"
+    };
+    let item_play_pause = CheckMenuItem::new(play_pause_label, true, initial_playing, None);
+
+    // 3. Navigation
+    let item_prev_track = MenuItem::new("⏮ Previous Track", true, None);
+    let item_next_track = MenuItem::new("⏭ Next Track", true, None);
+
+    // 4. Playback modes
+    let item_repeat = CheckMenuItem::new("🔁 Repeat Current Track", true, config.repeat, None);
+
+    // 5. Volume Submenu with live percentage title and Mute toggle
     let nearest_volume = *VOLUME_LEVELS
         .iter()
         .min_by_key(|lvl| (**lvl as i16 - config.volume_percent as i16).abs())
         .unwrap_or(&75);
-    let volume_menu = Submenu::new("Volume", true);
+    let volume_menu = Submenu::new(format!("🔊 Volume ({}%)", config.volume_percent), true);
+    let item_mute = CheckMenuItem::new("🔇 Mute", true, false, None);
+    let _ = volume_menu.append(&item_mute);
+    let _ = volume_menu.append(&PredefinedMenuItem::separator());
+
     let volume_items: Vec<(u8, CheckMenuItem)> = VOLUME_LEVELS
         .iter()
         .map(|&lvl| {
@@ -692,32 +1167,49 @@ fn main() {
         let _ = volume_menu.append(item);
     }
 
-    let item_auto_play =
-        CheckMenuItem::new("Auto-Play Music on EPulse Startup", true, config.auto_play_on_startup, None);
-    let item_run_on_boot =
-        CheckMenuItem::new("Run EPulse on Windows Startup", true, is_registered_in_startup(), None);
-    let item_open_folder = MenuItem::new("Open EPulse Music Folder", true, None);
-    let item_quit = MenuItem::new("Quit EPulse", true, None);
+    // 6. Settings Submenu
+    let settings_menu = Submenu::new("⚙ Settings", true);
+    let item_auto_play = CheckMenuItem::new(
+        "Auto-Play on EPulse Launch",
+        true,
+        config.auto_play_on_startup,
+        None,
+    );
+    let item_run_on_boot = CheckMenuItem::new(
+        "Run EPulse on Windows Startup",
+        true,
+        is_registered_in_startup(),
+        None,
+    );
+    let _ = settings_menu.append(&item_auto_play);
+    let _ = settings_menu.append(&item_run_on_boot);
+
+    // 7. Folder, Rescan and Exit
+    let item_open_folder = MenuItem::new("📁 Open Music Folder", true, None);
+    let item_rescan = MenuItem::new("🔄 Rescan Music Folder", true, None);
+    let item_quit = MenuItem::new("❌ Quit EPulse", true, None);
 
     let _ = tray_menu.append_items(&[
-        &item_enable_music,
+        &item_now_playing,
+        &PredefinedMenuItem::separator(),
+        &item_play_pause,
+        &item_prev_track,
         &item_next_track,
         &PredefinedMenuItem::separator(),
-        &item_shuffle,
+        &item_repeat,
         &volume_menu,
         &PredefinedMenuItem::separator(),
-        &item_auto_play,
-        &item_run_on_boot,
-        &PredefinedMenuItem::separator(),
         &item_open_folder,
+        &item_rescan,
+        &settings_menu,
         &PredefinedMenuItem::separator(),
         &item_quit,
     ]);
 
     let tray_icon = TrayIconBuilder::new()
         .with_menu(Box::new(tray_menu))
-        .with_menu_on_left_click(false) // left-click toggles music, right-click opens the menu
-        .with_tooltip(tooltip(initial_playing))
+        .with_menu_on_left_click(false)
+        .with_tooltip(tooltip(initial_playing, None))
         .with_icon(if initial_playing {
             icon_active.clone()
         } else {
@@ -729,26 +1221,67 @@ fn main() {
     let menu_channel = MenuEvent::receiver();
     let tray_channel = TrayIconEvent::receiver();
 
-    // Keeps icon, tooltip, menu state, shared flag and audio thread in sync.
-    let apply_playing = |on: bool| {
+    let apply_playing = |on: bool, title: Option<&str>| {
         is_enabled.store(on, Ordering::Release);
-        item_enable_music.set_checked(on);
+        item_play_pause.set_checked(on);
+        if on {
+            item_play_pause.set_text("⏸ Pause (Left-Click Icon)");
+        } else {
+            item_play_pause.set_text("▶ Resume Playback (Left-Click Icon)");
+        }
         let _ = cmd_tx.send(AudioCommand::SetEnabled(on));
         let _ = tray_icon.set_icon(Some(if on {
             icon_active.clone()
         } else {
             icon_disabled.clone()
         }));
-        let _ = tray_icon.set_tooltip(Some(tooltip(on)));
+        let _ = tray_icon.set_tooltip(Some(tooltip(on, title)));
     };
 
-    // ── Win32 message loop (blocks in the kernel, ~0% CPU when idle) ──
+    // ── Win32 message loop ──
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
 
+            // Handle Global Multimedia Hotkeys (Keyboards with Play/Pause, Next, Prev)
+            if msg.message == WM_HOTKEY {
+                match msg.wParam as i32 {
+                    HOTKEY_PLAY_PAUSE => {
+                        apply_playing(!is_enabled.load(Ordering::Acquire), current_title.as_deref());
+                    }
+                    HOTKEY_NEXT_TRACK => {
+                        let _ = cmd_tx.send(AudioCommand::NextTrack);
+                    }
+                    HOTKEY_PREV_TRACK => {
+                        let _ = cmd_tx.send(AudioCommand::PrevTrack);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Handle track title changes from audio worker
+            while let Ok(event) = ui_rx.try_recv() {
+                match event {
+                    UiMessage::TrackChanged(title) => {
+                        let display_title = if title.chars().count() > 40 {
+                            let truncated: String = title.chars().take(37).collect();
+                            format!("{truncated}...")
+                        } else {
+                            title.clone()
+                        };
+                        // Escape Win32 accelerator ampersands (& -> &&)
+                        let safe_menu_title = display_title.replace('&', "&&");
+                        item_now_playing.set_text(format!("🎵 {safe_menu_title}"));
+                        current_title = Some(title);
+                        let is_on = is_enabled.load(Ordering::Acquire);
+                        let _ = tray_icon.set_tooltip(Some(tooltip(is_on, current_title.as_deref())));
+                    }
+                }
+            }
+
+            // Left-Click Toggle
             while let Ok(event) = tray_channel.try_recv() {
                 if let TrayIconEvent::Click {
                     button: MouseButton::Left,
@@ -756,19 +1289,30 @@ fn main() {
                     ..
                 } = event
                 {
-                    apply_playing(!is_enabled.load(Ordering::Acquire));
+                    apply_playing(!is_enabled.load(Ordering::Acquire), current_title.as_deref());
                 }
             }
 
+            // Menu Items Handling
             while let Ok(event) = menu_channel.try_recv() {
-                if event.id == item_enable_music.id() {
-                    apply_playing(item_enable_music.is_checked());
+                if event.id == item_play_pause.id() {
+                    apply_playing(item_play_pause.is_checked(), current_title.as_deref());
+                } else if event.id == item_prev_track.id() {
+                    let _ = cmd_tx.send(AudioCommand::PrevTrack);
                 } else if event.id == item_next_track.id() {
                     let _ = cmd_tx.send(AudioCommand::NextTrack);
-                } else if event.id == item_shuffle.id() {
-                    config.shuffle = item_shuffle.is_checked();
+                } else if event.id == item_repeat.id() {
+                    config.repeat = item_repeat.is_checked();
                     let _ = config.save();
-                    let _ = cmd_tx.send(AudioCommand::SetShuffle(config.shuffle));
+                    let _ = cmd_tx.send(AudioCommand::SetRepeat(config.repeat));
+                } else if event.id == item_mute.id() {
+                    let is_muted = item_mute.is_checked();
+                    let _ = cmd_tx.send(AudioCommand::SetMute(is_muted));
+                    if is_muted {
+                        volume_menu.set_text("🔇 Volume (Muted)");
+                    } else {
+                        volume_menu.set_text(format!("🔊 Volume ({}%)", config.volume_percent));
+                    }
                 } else if event.id == item_auto_play.id() {
                     config.auto_play_on_startup = item_auto_play.is_checked();
                     let _ = config.save();
@@ -783,25 +1327,35 @@ fn main() {
                         .map(|root| PathBuf::from(root).join("explorer.exe"))
                         .unwrap_or_else(|| PathBuf::from("explorer.exe"));
                     let _ = Command::new(explorer).arg(&music_dir).spawn();
+                } else if event.id == item_rescan.id() {
+                    let _ = cmd_tx.send(AudioCommand::Rescan);
                 } else if event.id == item_quit.id() {
                     let _ = cmd_tx.send(AudioCommand::Shutdown);
-                    PostQuitMessage(0); // ends the loop so the tray icon is dropped properly
+                    PostQuitMessage(0);
                 } else if let Some((level, _)) =
                     volume_items.iter().find(|(_, item)| event.id == item.id())
                 {
                     let level = *level;
+                    item_mute.set_checked(false);
                     for (l, item) in &volume_items {
                         item.set_checked(*l == level);
                     }
                     config.volume_percent = level;
                     let _ = config.save();
+                    let _ = cmd_tx.send(AudioCommand::SetMute(false));
                     let _ = cmd_tx.send(AudioCommand::SetVolume(level));
+                    volume_menu.set_text(format!("🔊 Volume ({level}%)"));
                 }
             }
         }
     }
 
-    // Clean shutdown: remove the tray icon, then give the audio thread up to 1 s to finish.
+    // Clean shutdown: unregister hotkeys, remove tray icon, flush audio thread
+    unsafe {
+        UnregisterHotKey(std::ptr::null_mut(), HOTKEY_PLAY_PAUSE);
+        UnregisterHotKey(std::ptr::null_mut(), HOTKEY_NEXT_TRACK);
+        UnregisterHotKey(std::ptr::null_mut(), HOTKEY_PREV_TRACK);
+    }
     let _ = cmd_tx.send(AudioCommand::Shutdown);
     drop(tray_icon);
     let deadline = Instant::now() + Duration::from_secs(1);
